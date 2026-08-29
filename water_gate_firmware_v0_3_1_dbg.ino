@@ -3,6 +3,8 @@
 // 対象: ESP32 (Freenove WROOM 38pin) / Arduino IDE
 //
 // v0.4.0: LittleFSに /gate.csv としてイベントログを追記。
+//         jogにJAM監視、CLOSEのパルスなしTIMEOUTを位置喪失扱い、電極は1回通電で両読み、
+//         VERIFY中も手動SWを受付。
 //         時刻は電源投入からの経過秒(gettimeofday: ディープスリープを跨いで進み続ける)。
 //         読み出し: USB接続→BOOTで起床→5秒窓の間にシリアルで d(ダンプ)/i(残量)/x(消去)。
 //         コマンド処理ごとに窓を5秒延長するのでダンプ中に切れない。
@@ -21,7 +23,7 @@
 //  - TURNS_OPENはNVS保存(電源断でも生存)、現在位置はRTCメモリ
 //  - CALIB放置30分 → LED消灯で完全停止(復帰は電源再投入のみ)
 //
-// LED意味論(v0.3):
+// LED意味論(v0.3以降):
 //  BOOTボタン押下→点灯  = 正常(起床5秒の操作受付ウィンドウ)
 //  点灯しっぱなし        = 動作中(開閉・検証中)
 //  ゆっくり点滅(1秒周期) = CALIB待機中(位置登録を求めている)
@@ -32,7 +34,8 @@
 #include <LittleFS.h>
 #include <time.h>
 
-#define BENCH_MODE 0   // 卓上: 1(シリアルで水位指令) / 実運用: 0(電極センサ)
+#define BENCH_MODE  0   // 卓上: 1(シリアルで水位指令) / 実運用: 0(電極センサ)
+#define CALIB_DEBUG 0   // 1: CALIBジョグ時にホールパルス間隔をシリアルに出す(v0.3.1-dbgの診断機能)
 #if BENCH_MODE
 RTC_DATA_ATTR char benchWater = 'h';  // 'h'=水位高(閉でよい) 'l'=水位低(開けたい)
 #endif
@@ -60,12 +63,12 @@ const int ACS_JAM_DELTA = 150;
 // ---------------- 機構・タイミング定数 ----------------
 const unsigned long MS_PER_TURN        = 1500;   // 10RPM 磁石4つ
 const unsigned long TURN_TIMEOUT_MARGIN = 4000;
-const unsigned long SLEEP_US           = 10ULL * 60 * 1000000; // スリープ10分(水位サイクルと同一)
-// const unsigned long SLEEP_US           = 10ULL * 1000000; // スリープ10秒(短縮)
+const uint64_t      SLEEP_US           = 10ULL * 60 * 1000000; // スリープ10分(水位サイクルと同一) ※64bit: 32bitだと2時間超で桁あふれ
+// const uint64_t      SLEEP_US           = 10ULL * 1000000; // スリープ10秒(短縮)
 const unsigned long SW_WINDOW_MS       = 5000;   // 起床後の手動SW受付ウィンドウ
 const int  VERIFY_COUNT                = 6;
 const unsigned long VERIFY_INTERVAL_MS = 10000;
-const int  WATER_ADC_THRESHOLD         = 2000;   // ★電極実測後に調整
+const int  WATER_ADC_THRESHOLD         = 2000;   // ★未確定: ログのCYCLE行(上ADC,下ADC)を1〜2日分見てWET/DRYの谷間に置く
 const unsigned long CALIB_CONFIRM_MS   = 10000;  // 10秒放置で確定
 const unsigned long CALIB_TIMEOUT_MS   = 30UL * 60 * 1000; // 30分で完全停止
 
@@ -197,13 +200,17 @@ const char* wakeCauseName() {
 // =====================================================================
 // 低レベル
 // =====================================================================
+#if CALIB_DEBUG
 volatile unsigned long pulseMs[32];
 volatile int pulseIdx = 0;
+#endif
 void IRAM_ATTR onHallPulse() {
   unsigned long now = millis();
   if (now - lastHallMs > 50) {
     hallCount++;
+#if CALIB_DEBUG
     if (pulseIdx < 32) pulseMs[pulseIdx++] = now;
+#endif
     lastHallMs = now;
   }
 }
@@ -282,7 +289,7 @@ bool openGate() {
 
   Serial.printf("[OPEN] fail(%d) -> position lost\n", r);
   relayAllOff();
-  driveTurns(false, 1, "RETREAT");   // 安全側: 少し繰り出して張力を抜く
+  driveTurns(false, 1, "RETREAT");   // 安全側: 少し繰り出して張力を抜く(結果は見ない: どのみち位置は破棄しCALIBへ)
   rtcPosition = -1;       // 次回起動でCALIB要求
   return false;
 }
@@ -300,7 +307,12 @@ bool closeGate() {
     rtcPosition = -1;
     return false;
   }
-  rtcPosition = 0;        // TIMEOUTは着座後の空転猶予とみなしOK側に倒す
+  if (r == GATE_TIMEOUT && hallCount == 0) {   // 1パルスも来ないTIMEOUT=ホールセンサ無応答(空転ではない)
+    Serial.println("[CLOSE] timeout with no hall pulses -> position lost");
+    rtcPosition = -1;
+    return false;
+  }
+  rtcPosition = 0;        // パルスありのTIMEOUTは着座後の空転猶予とみなしOK側に倒す
   return true;
 }
 
@@ -311,19 +323,24 @@ bool closeGate() {
 WaterSample sampleWater() { return { benchWater != 'l', -1, -1 }; }
 #else
 bool wet(int adc) { return adc < WATER_ADC_THRESHOLD; }
-int readElectrode(int pin) {
-  digitalWrite(PIN_ELEC_DRIVE, HIGH);
-  delay(30);
+int avgAdc(int pin) {
   long sum = 0;
   for (int i = 0; i < 8; i++) { sum += analogRead(pin); delay(2); }
+  return sum / 8;
+}
+// 1回の通電で上下両方を読む(電食を抑えるため通電時間を最小に)
+void readElectrodes(int &adcHi, int &adcLo) {
+  digitalWrite(PIN_ELEC_DRIVE, HIGH);
+  delay(30);
+  adcHi = avgAdc(PIN_ELEC_HIGH);
+  adcLo = avgAdc(PIN_ELEC_LOW);
   digitalWrite(PIN_ELEC_DRIVE, LOW);
-  int adc = sum / 8;
-  Serial.printf("[ELEC] pin=%s adc=%d -> %s\n",
-                pin == PIN_ELEC_HIGH ? "VP(上)" : "VN(下)", adc, wet(adc) ? "WET" : "DRY");
-  return adc;
+  Serial.printf("[ELEC] VP(上)=%d %s / VN(下)=%d %s\n",
+                adcHi, wet(adcHi) ? "WET" : "DRY", adcLo, wet(adcLo) ? "WET" : "DRY");
 }
 WaterSample sampleWater() {
-  WaterSample w = { false, readElectrode(PIN_ELEC_HIGH), readElectrode(PIN_ELEC_LOW) };
+  WaterSample w = { false, -1, -1 };
+  readElectrodes(w.adcHi, w.adcLo);
   if (wet(w.adcHi))       w.high = true;
   else if (!wet(w.adcLo)) w.high = false;
   else                    w.high = (rtcPosition == 0);  // 中間帯は現状維持
@@ -331,11 +348,27 @@ WaterSample sampleWater() {
 }
 #endif
 
+// 手動SWが押されていれば手動動作を実行して眠る(戻らない)。窓・VERIFY中の共通処理
+void manualSwitchCheck() {
+  if (digitalRead(PIN_SW_OPEN) == LOW)  { logEvent("MANUAL,open,%d",  rtcPosition); openGate();  goToSleep(); }
+  if (digitalRead(PIN_SW_CLOSE) == LOW) { logEvent("MANUAL,close,%d", rtcPosition); closeGate(); goToSleep(); }
+}
+
+// 待機しつつ手動SW/シリアルを見る(delayの置き換え)
+void waitWatching(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    manualSwitchCheck();
+    handleSerialCommand();
+    delay(20);
+  }
+}
+
 bool verifyRequest(bool wantHigh) {
   digitalWrite(PIN_LED, HIGH);  // 検証中=点灯
   Serial.printf("[VERIFY] start (need %d consecutive)\n", VERIFY_COUNT);
   for (int i = 0; i < VERIFY_COUNT; i++) {
-    delay(VERIFY_INTERVAL_MS);
+    waitWatching(VERIFY_INTERVAL_MS);   // 最大60秒の間も手動SWを優先する
     WaterSample w = sampleWater();
     Serial.printf("[VERIFY] %d/%d: wantHigh=%d now=%d\n", i + 1, VERIFY_COUNT, wantHigh, w.high);
     if (w.high != wantHigh) {
@@ -364,18 +397,32 @@ void jog(bool dirOpen, int &netTurns) {
   hallCount = 0;
   attachInterrupt(digitalPinToInterrupt(PIN_HALL), onHallPulse, FALLING);
   digitalWrite(dirOpen ? PIN_RELAY_OPEN : PIN_RELAY_CLOSE, RELAY_ON);
-  while (digitalRead(dirOpen ? PIN_SW_OPEN : PIN_SW_CLOSE) == LOW) delay(20);
+  delay(300);  // 突入マスク
+  bool jam = false;
+  int acs = -1;
+  while (digitalRead(dirOpen ? PIN_SW_OPEN : PIN_SW_CLOSE) == LOW) {
+    acs = readACS();                       // 押している間もJAM監視(ワイヤー絡み等で自動停止)
+    if (isOverCurrent(acs)) { jam = true; break; }
+    delay(10);
+  }
   relayAllOff();
   detachInterrupt(digitalPinToInterrupt(PIN_HALL));
   hallPower(false);
   netTurns += dirOpen ? hallCount : -hallCount;
-  Serial.printf("[JOG] dir=%s hallCount=%d -> netTurns=%d (GPIO35 now=%d)\n",
-                dirOpen ? "OPEN" : "CLOSE", hallCount, netTurns, digitalRead(PIN_HALL));
-  logEvent("CALIB,jog,%s,%d,%d", dirOpen ? "open" : "close", hallCount, netTurns);
+  Serial.printf("[JOG] dir=%s hallCount=%d -> netTurns=%d (GPIO35 now=%d)%s\n",
+                dirOpen ? "OPEN" : "CLOSE", hallCount, netTurns, digitalRead(PIN_HALL),
+                jam ? " JAM -> stopped" : "");
+  logEvent("CALIB,jog,%s,%s,%d,%d,%d", dirOpen ? "open" : "close", jam ? "jam" : "ok", hallCount, netTurns, acs);
+  if (jam) {
+    ledBlink(10, 50, 50);   // 速点滅×10=異常(全開無効と同じ合図)。SWを離すまで待って再開
+    while (digitalRead(dirOpen ? PIN_SW_OPEN : PIN_SW_CLOSE) == LOW) delay(20);
+  }
+#if CALIB_DEBUG
   for (int i = 1; i < pulseIdx; i++) {
     Serial.printf("  pulse[%d] interval = %lu ms\n", i, pulseMs[i] - pulseMs[i-1]);
   }
   pulseIdx = 0;
+#endif
   delay(300);
 }
 
@@ -449,7 +496,7 @@ void calibMode() {
 }
 
 // =====================================================================
-// 通常サイクル(起床ごとに実行 / タイマー起床とEN起床は区別しない)
+// 通常サイクル(起床ごとに実行 / タイマー起床とBOOT起床で処理は同じ。要因はBOOT行に記録)
 // =====================================================================
 void wakeCycle() {
   // 起床表示 兼 操作受付ウィンドウ(5秒): LED点灯のままSW/シリアルコマンドを待つ
@@ -457,8 +504,7 @@ void wakeCycle() {
   digitalWrite(PIN_LED, HIGH);
   unsigned long t0 = millis();
   while (millis() - t0 < SW_WINDOW_MS) {
-    if (digitalRead(PIN_SW_OPEN) == LOW)  { logEvent("MANUAL,open,%d",  rtcPosition); openGate();  goToSleep(); }
-    if (digitalRead(PIN_SW_CLOSE) == LOW) { logEvent("MANUAL,close,%d", rtcPosition); closeGate(); goToSleep(); }
+    manualSwitchCheck();
     if (handleSerialCommand()) t0 = millis();
     delay(20);
   }
@@ -503,10 +549,9 @@ void setup() {
   gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)PIN_RELAY_OPEN);
   gpio_hold_dis((gpio_num_t)PIN_RELAY_CLOSE);
-  digitalWrite(PIN_RELAY_OPEN,  RELAY_OFF);
-  digitalWrite(PIN_RELAY_CLOSE, RELAY_OFF);
-  pinMode(PIN_RELAY_OPEN,  OUTPUT);
-  pinMode(PIN_RELAY_CLOSE, OUTPUT);
+  // core 3.x では出力化前のdigitalWriteは無効(ログだけ出て捨てられる)ため、pinMode直後にOFFを明示する
+  pinMode(PIN_RELAY_OPEN,  OUTPUT); digitalWrite(PIN_RELAY_OPEN,  RELAY_OFF);
+  pinMode(PIN_RELAY_CLOSE, OUTPUT); digitalWrite(PIN_RELAY_CLOSE, RELAY_OFF);
   pinMode(PIN_HALL_POWER, OUTPUT); digitalWrite(PIN_HALL_POWER, LOW);
   pinMode(PIN_HALL, INPUT);
   pinMode(PIN_SW_OPEN,  INPUT_PULLUP);
