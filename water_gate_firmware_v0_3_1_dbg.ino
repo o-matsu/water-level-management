@@ -30,7 +30,7 @@
 
 #include <Preferences.h>
 #include <LittleFS.h>
-#include <sys/time.h>
+#include <time.h>
 
 #define BENCH_MODE 0   // 卓上: 1(シリアルで水位指令) / 実運用: 0(電極センサ)
 #if BENCH_MODE
@@ -116,7 +116,7 @@ void logEvent(const char* fmt, ...) {
   va_start(ap, fmt);
   n += vsnprintf(line + n, sizeof(line) - n - 1, fmt, ap);
   va_end(ap);
-  if (n > (int)sizeof(line) - 2) n = sizeof(line) - 2;
+  n = min(n, (int)sizeof(line) - 2);   // vsnprintfは切り詰め前の長さを返すので実長に丸める('\n'+'\0'分を残す)
   line[n++] = '\n'; line[n] = '\0';
   Serial.printf("[LOG] %s", line);
   if (!fsReady) return;
@@ -154,8 +154,11 @@ void logInfo() {
                 (unsigned)total, (unsigned)fsUsed, (unsigned long)uptimeSec());
 }
 
+bool eraseArmed = false;   // 'x'は2回連続で消去(誤タイプ対策)
 void logErase() {
   if (!fsReady) { Serial.println("[LOG] no fs"); return; }
+  if (!eraseArmed) { eraseArmed = true; Serial.println("[LOG] send 'x' again to erase"); return; }
+  eraseArmed = false;
   LittleFS.remove(LOG_PATH);
   Serial.println("[LOG] erased");
   logEvent("ERASE");
@@ -175,17 +178,20 @@ bool handleSerialCommand() {
 #endif
       default: continue;   // 改行等は無視(窓も延長しない)
     }
+    if (c != 'x') eraseArmed = false;   // 間に別コマンドが挟まったら消去は解除
     handled = true;
   }
   return handled;
 }
 
+// 起床要因: timer / button(BOOT, ext0) / reset(位置喪失後のESP.restart等ソフトリセット) / cold(電源投入・EN)
 const char* wakeCauseName() {
   switch (esp_sleep_get_wakeup_cause()) {
     case ESP_SLEEP_WAKEUP_TIMER: return "timer";
     case ESP_SLEEP_WAKEUP_EXT0:  return "button";
-    default:                     return "cold";
+    default: break;
   }
+  return (esp_reset_reason() == ESP_RST_SW) ? "reset" : "cold";
 }
 
 // =====================================================================
@@ -254,6 +260,7 @@ GateResult driveTurns(bool dirOpen, int turns, const char* tag) {
   relayAllOff();
   detachInterrupt(digitalPinToInterrupt(PIN_HALL));
   hallPower(false);
+  if (acs == 0) acs = -1;   // ループに入る前に到達した(=未測定)場合は-1で区別
   logEvent("%s,%s,%d,%d,%d", tag, gateResultName(result), rtcPosition, hallCount, acs);
   delay(300);
   return result;
@@ -398,7 +405,7 @@ void calibMode() {
       esp_deep_sleep_start();   // 起床要因なし=永久停止
     }
     // シリアルコマンド(d/i/x): 持ち帰り時はRTCメモリ消失でここに来るのでCALIB中も受け付ける
-    if (handleSerialCommand()) enterTime = millis();
+    if (handleSerialCommand()) { enterTime = millis(); lastAction = millis(); }  // ダンプ中に10秒確定が走らないよう両方延長
     // ジョグ
     if (digitalRead(PIN_SW_OPEN) == LOW)  { digitalWrite(PIN_LED, HIGH); jog(true,  netTurns); touched = true; lastAction = millis(); enterTime = millis(); }
     if (digitalRead(PIN_SW_CLOSE) == LOW) { digitalWrite(PIN_LED, HIGH); jog(false, netTurns); touched = true; lastAction = millis(); enterTime = millis(); }
