@@ -18,7 +18,7 @@ ESP32 が 10 分周期のディープスリープで低消費電力に動作し�
 
 | パス | 内容 |
 |---|---|
-| [`water_gate_firmware/water_gate_firmware.ino`](water_gate_firmware/water_gate_firmware.ino) | ESP32 ファームウェア(1 ファイル完結。Arduino の慣例どおりスケッチ名と同名のフォルダに置く) |
+| [`water-level-management.ino`](water-level-management.ino) | ESP32 ファームウェア(1 ファイル完結)。リポジトリ自体が Arduino スケッチフォルダ(フォルダ名 = スケッチ名) |
 | [`doc/bom.md`](doc/bom.md) | 部品表 v7(実機確定版)。設計ルール・ボックス内配置・現地実測項目・実測値 |
 | [`doc/wiring-and-gpio.md`](doc/wiring-and-gpio.md) | 結線表・GPIO 割当 v2。電源系/リレー/センサ系の配線、チャーコン設定、立ち上げ手順、ファーム定数の根拠 |
 | [`LICENSE`](LICENSE) | MIT License |
@@ -172,7 +172,7 @@ CALIB 系: `CALIB,enter,位置,全開回転数` / `CALIB,jog,open|close,ok|jam,�
 
 1. Arduino IDE に ESP32 ボードパッケージをインストールします(`Preferences.h` は同梱)。
 2. ボードに「ESP32 Dev Module」を選択し、**Upload Speed = 115200** にします(921600 は失敗します)。
-3. `water_gate_firmware/water_gate_firmware.ino` を開いて書き込みます。
+3. クローンしたフォルダの `water-level-management.ino` を開いて書き込みます(フォルダ名を変えると開けなくなります。旧 Arduino IDE 1.x はハイフン付きスケッチ名を受け付けないため IDE 2.x を使ってください)。
 4. シリアルモニタを **115200 bps** で開くと `[CYCLE]` `[VERIFY]` `[CALIB]` `[JOG]` `[ELEC]` `[LOG]` の診断ログが確認できます。
 5. 書き込みで RTC メモリが消えるため、起動後は CALIB モードから始まります。LittleFS のログ(`/gate.csv`)と NVS の全開回転数は消えません。
 
@@ -182,7 +182,7 @@ CALIB 系: `CALIB,enter,位置,全開回転数` / `CALIB,jog,open|close,ok|jam,�
 arduino-cli core install esp32:esp32
 arduino-cli board list                        # ポート確認(例: /dev/cu.usbserial-110)
 arduino-cli compile --fqbn esp32:esp32:esp32:UploadSpeed=115200 \
-  -u -p /dev/cu.usbserial-110 water_gate_firmware
+  -u -p /dev/cu.usbserial-110 .                 # リポジトリ直下で実行
 ```
 
 - `UploadSpeed=115200` は必須です。デフォルトの 921600 では stub flasher 起動後の速度切替で `Unable to verify flash chip connection` になります(実機で確認済み)。
