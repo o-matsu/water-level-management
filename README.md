@@ -173,8 +173,25 @@ CALIB 系: `CALIB,enter,位置,全開回転数` / `CALIB,jog,open|close,ok|jam,�
 1. Arduino IDE に ESP32 ボードパッケージをインストールします(`Preferences.h` は同梱)。
 2. ボードに「ESP32 Dev Module」を選択し、**Upload Speed = 115200** にします(921600 は失敗します)。
 3. `water_gate_firmware_v0_3_1_dbg.ino` を書き込みます。
-4. シリアルモニタを **115200 bps** で開くと `[CYCLE]` `[VERIFY]` `[CALIB]` `[JOG]` `[ELEC]` `[OPEN]` `[CLOSE]` の診断ログが確認できます。
-5. 書き込みで RTC メモリが消えるため、起動後は CALIB モードから始まります。
+4. シリアルモニタを **115200 bps** で開くと `[CYCLE]` `[VERIFY]` `[CALIB]` `[JOG]` `[ELEC]` `[LOG]` の診断ログが確認できます。
+5. 書き込みで RTC メモリが消えるため、起動後は CALIB モードから始まります。LittleFS のログ(`/gate.csv`)と NVS の全開回転数は消えません。
+
+### arduino-cli で書き込む場合
+
+Arduino はフォルダ名とスケッチ名の一致を要求するため、一度スケッチ名のフォルダにコピーしてからビルドします。
+
+```sh
+arduino-cli core install esp32:esp32
+mkdir -p /tmp/water_gate_firmware_v0_3_1_dbg
+cp water_gate_firmware_v0_3_1_dbg.ino /tmp/water_gate_firmware_v0_3_1_dbg/
+arduino-cli board list                        # ポート確認(例: /dev/cu.usbserial-110)
+arduino-cli compile --fqbn esp32:esp32:esp32:UploadSpeed=115200 \
+  -u -p /dev/cu.usbserial-110 /tmp/water_gate_firmware_v0_3_1_dbg
+```
+
+- `UploadSpeed=115200` は必須です。デフォルトの 921600 では stub flasher 起動後の速度切替で `Unable to verify flash chip connection` になります(実機で確認済み)。
+- `-u` を外せばコンパイルのみ。`BENCH_MODE` / `CALIB_DEBUG` を切り替えたビルドの検証にも使えます。
+- 書き込み後の確認は `arduino-cli monitor -p /dev/cu.usbserial-110 -c baudrate=115200`(対話端末が必要)か、任意のシリアルモニタで `i` / `d` を送ります。
 
 ### 卓上試験(BENCH_MODE)
 
@@ -183,7 +200,7 @@ CALIB 系: `CALIB,enter,位置,全開回転数` / `CALIB,jog,open|close,ok|jam,�
 - `l` : 水位低(開けたい)
 - `h` : 水位高(閉でよい)
 
-指令は起床時の操作受付ウィンドウ後に読み取られ、RTC メモリに保持されます。
+指令は起床時の操作受付ウィンドウ中(および VERIFY 中)に `d`/`i`/`x` と同じ経路で読み取られ、RTC メモリに保持されます。
 
 ## ハードウェア立ち上げ手順(要約)
 
@@ -200,6 +217,7 @@ CALIB 系: `CALIB,enter,位置,全開回転数` / `CALIB,jog,open|close,ok|jam,�
 
 ## 変更履歴
 
+- **v0.4.0**: LittleFS イベントログ(`/gate.csv`、経過秒付き)とシリアルコマンド `d`/`i`/`x` を追加。CALIB ジョグの JAM 監視、ホールパルスなし CLOSE タイムアウトの位置喪失扱い、電極の 1 回通電両読み、VERIFY 中の手動 SW 受付。
 - **v0.3.1**: 生存確認 / 即時起床を BOOT ボタン(GPIO0, ext0 起床)に変更。EN ボタンは RTC メモリが消えるため不使用に。
 - **v0.3**: 心拍方式を廃止しスリープ 10 分周期に統合。起床時 5 秒の操作受付ウィンドウを追加。`gpio_hold` でスリープ中のリレー浮きを固定。
 - **v0.2.1**: ホールセンサ電源 ON 時の偽エッジ(+1)対策。
