@@ -1,7 +1,8 @@
 // =====================================================================
-// 田圃水管理ロボット ファームウェア v0.5.0 (ハイブリッド位置制御版)
+// 田圃水管理ロボット ファームウェア v0.5.1 (ハイブリッド位置制御版)
 // 対象: ESP32 (Freenove WROOM 38pin) / Arduino IDE
 //
+// v0.5.1: リレー投入ノイズの偽エッジ対策(マスク・棄却・学習の妥当範囲)、磁石検出幅の学習とB側エッジ再同期。
 // v0.5.0: 位置をホールエッジ+時間補間で 1/1000カウント(mc)単位で管理。
 //         - 開はFALLING、閉はRISINGを数える(どちらも磁石の同じ側=同じ物理点で止まる)
 //         - エッジ間は直近の実測速度(ms/カウント, 方向別に学習)で補間
@@ -81,6 +82,9 @@ const int32_t POS_UNKNOWN   = INT32_MIN;
 const int32_t CLOSE_BIAS_MC = 30;     // 閉はゼロ点のこれだけ手前で止める(≒1mm)。弛み→蓋の傾きを防ぐ
 const int32_t OPEN_MIN_MC   = 500;    // 全開登録の最小値(これ未満は無効)
 const int     MS_PER_COUNT_MIN = 300, MS_PER_COUNT_MAX = 5000;  // 学習に使うパルス間隔の妥当範囲
+const int32_t EDGE_SNAP_TOL_MC = 350;   // 推定位置からこれ以上離れたエッジは偽エッジとして無視
+const int32_t ZONE_MIN_MC = 50, ZONE_MAX_MC = 700;  // 磁石検出幅の妥当範囲
+const unsigned long INRUSH_MASK_MS = 300;           // リレー投入直後: 電流監視もエッジも無視(ノイズ)
 
 // ---------------- ログ ----------------
 const char*  LOG_PATH      = "/gate.csv";
@@ -98,6 +102,7 @@ struct WaterSample { bool high; int adcHi; int adcLo; };   // adc=-1: BENCH(電�
 RTC_DATA_ATTR uint32_t rtcMagic = 0;
 RTC_DATA_ATTR int32_t  rtcPosMc = POS_UNKNOWN;   // 現在位置[mc] 0=全閉(ゼロ点)
 RTC_DATA_ATTR int      rtcMsPerCount[2] = { MS_PER_COUNT_DEF, MS_PER_COUNT_DEF };  // [0]=閉 [1]=開 の学習速度
+RTC_DATA_ATTR int32_t  rtcZoneMc = 0;            // 磁石の検出幅[mc](0=未学習)。B側エッジでの再同期に使う
 
 Preferences prefs;
 int32_t openMc = 0;                         // 全開位置[mc](NVSからロード)
@@ -257,6 +262,10 @@ void ledBlink(int times, int onMs, int offMs) {
 //  位置[mc]をエッジで同期し、エッジ間は実測速度で時間補間する。
 //  開: FALLING(磁石がセンサに到達) / 閉: RISING(センサが同じ側から離脱) を数える
 //   → 方向によらず「磁石のA側」= 整数カウント位置で同期される。
+//  反対側(B側 = 整数+検出幅)のエッジも、検出幅を学習済みなら再同期に使う
+//   → 閉の最終区間(最後の同期点→ゼロ点)が 1カウント から 検出幅 に縮み、補間誤差が減る。
+//  現場実測(2026-08-30)でリレー投入時の偽エッジが毎回1個入り速度学習を壊していたため、
+//  突入マスク中のエッジ破棄・推定位置から遠いエッジの棄却・速度学習の妥当範囲を設けた。
 //  targetMc: 目標位置(POS_UNKNOWNなら目標なし=holdPinを離すまで)
 //  holdPin : 押している間だけ動かすSW(-1なら使わない)
 //  tag     : ログのイベント名。1駆動=1行 "tag,結果,開始mc,終了mc,エッジ数,ms/カウント,ACS"
@@ -280,12 +289,14 @@ MoveResult moveGate(bool dirOpen, int32_t targetMc, int holdPin, const char* tag
   int32_t  anchorMc = startMc;      // 直近の同期位置
   unsigned long anchorMs = start;   // その時刻
   unsigned long prevCountedMs = 0;  // 直近の計数エッジ時刻(速度学習用)
+  unsigned long lastASideMs = 0;    // 直近のA側エッジ時刻(検出幅学習用: 開方向のみ)
   int edges = 0;
   int acs = -1;
   GateResult result = GATE_OK;
 
   digitalWrite(dirOpen ? PIN_RELAY_OPEN : PIN_RELAY_CLOSE, RELAY_ON);
-  delay(300);                       // 突入マスク(この間も位置は時間で進める)
+  delay(INRUSH_MASK_MS);            // 突入マスク(この間も位置は時間で進める)
+  unsigned long maskUntil = start + INRUSH_MASK_MS;
 
   auto estimate = [&](unsigned long atMs) -> int32_t {
     if ((long)(atMs - anchorMs) < 0) atMs = anchorMs;   // 基準より古い時刻(起動直後の偽エッジ等)は進めない
@@ -296,19 +307,40 @@ MoveResult moveGate(bool dirOpen, int32_t targetMc, int holdPin, const char* tag
     // エッジ処理
     while (edgeTail != edgeHead) {
       unsigned long t = edgeMs[edgeTail];
-      bool counted = dirOpen ? (edgeLvl[edgeTail] == LOW) : (edgeLvl[edgeTail] == HIGH);
+      bool aSide = dirOpen ? (edgeLvl[edgeTail] == LOW) : (edgeLvl[edgeTail] == HIGH);  // 磁石A側(整数位置)のエッジか
       edgeTail = (edgeTail + 1) & 7;
-      if (!counted) continue;
+      if ((long)(t - maskUntil) < 0) continue;            // 突入マスク中=リレーノイズ
       int32_t est = estimate(t);
-      int32_t snapped = (int32_t)lroundf(est / 1000.0f) * 1000;   // 最寄りの整数カウントに同期
-      if (labs(est - snapped) > 400)
-        Serial.printf("[MOVE] edge far from estimate: est=%ld snap=%ld\n", (long)est, (long)snapped);
-      if (prevCountedMs) {
-        long iv = t - prevCountedMs;
-        if (iv >= MS_PER_COUNT_MIN && iv <= MS_PER_COUNT_MAX) msPer = (msPer + iv) / 2;  // 速度学習(EMA。パルスは規則的なので重め)
+      int32_t snapped;
+      if (aSide) {
+        snapped = (int32_t)lroundf(est / 1000.0f) * 1000;                       // 整数カウント
+      } else {
+        if (rtcZoneMc <= 0) {
+          // 検出幅未学習: 開方向ならA側からの経過で幅を学習(B側は整数+幅)
+          if (dirOpen && lastASideMs) {
+            int32_t w = (int32_t)((t - lastASideMs) * 1000UL / (unsigned long)msPer);
+            if (w >= ZONE_MIN_MC && w <= ZONE_MAX_MC) rtcZoneMc = w;
+          }
+          continue;
+        }
+        snapped = (int32_t)lroundf((est - rtcZoneMc) / 1000.0f) * 1000 + rtcZoneMc;   // 整数+検出幅
       }
-      prevCountedMs = t;
-      anchorMc = snapped; anchorMs = t; edges++;
+      if (labs(est - snapped) > EDGE_SNAP_TOL_MC) {         // 推定と合わない=偽エッジ
+        Serial.printf("[MOVE] reject edge: est=%ld snap=%ld\n", (long)est, (long)snapped);
+        continue;
+      }
+      if (aSide) {
+        if (prevCountedMs) {                                 // 速度学習(A側エッジ間=1カウント)
+          long iv = t - prevCountedMs;
+          if (iv >= MS_PER_COUNT_MIN && iv <= MS_PER_COUNT_MAX &&
+              iv >= msPer * 7 / 10 && iv <= msPer * 13 / 10) msPer = (msPer + iv) / 2;
+        }
+        prevCountedMs = t; lastASideMs = t; edges++;
+      } else if (dirOpen && lastASideMs) {                   // 検出幅学習(開方向: A側→B側の経過)
+        int32_t w = (int32_t)((t - lastASideMs) * 1000UL / (unsigned long)msPer);
+        if (w >= ZONE_MIN_MC && w <= ZONE_MAX_MC) rtcZoneMc = (rtcZoneMc + w) / 2;
+      }
+      anchorMc = snapped; anchorMs = t;
     }
     int32_t pos = estimate(millis());
     if (hasTarget && (dirOpen ? pos >= targetMc : pos <= targetMc)) { anchorMc = targetMc; anchorMs = millis(); break; }
@@ -323,7 +355,7 @@ MoveResult moveGate(bool dirOpen, int32_t targetMc, int holdPin, const char* tag
   detachInterrupt(digitalPinToInterrupt(PIN_HALL));
   hallPower(false);
   rtcPosMc = endMc;
-  logEvent("%s,%s,%ld,%ld,%d,%d,%d", tag, gateResultName(result), (long)startMc, (long)endMc, edges, msPer, acs);
+  logEvent("%s,%s,%ld,%ld,%d,%d,%ld,%d", tag, gateResultName(result), (long)startMc, (long)endMc, edges, msPer, (long)rtcZoneMc, acs);
   delay(300);
   return { result, edges };
 }
@@ -506,10 +538,11 @@ void calibMode() {
         prefs.putInt("openMc", openMc);
         prefs.putInt("msClose", rtcMsPerCount[0]);
         prefs.putInt("msOpen",  rtcMsPerCount[1]);
+        prefs.putInt("zoneMc",  rtcZoneMc);
         prefs.end();
         ledBlink(5, 100, 100);
         Serial.printf("[CALIB] open position registered: %ld mc (%.2f counts)\n", (long)openMc, openMc / 1000.0);
-        logEvent("CALIB,open,%ld,%d,%d", (long)openMc, rtcMsPerCount[0], rtcMsPerCount[1]);
+        logEvent("CALIB,open,%ld,%d,%d,%ld", (long)openMc, rtcMsPerCount[0], rtcMsPerCount[1], (long)rtcZoneMc);
 
         // 登録した全開位置から全閉へ戻して運用開始
         rtcMagic = RTC_MAGIC;
@@ -598,6 +631,7 @@ void setup() {
   if (rtcMagic != RTC_MAGIC) {   // cold/reset時は学習速度をNVSから復元(スリープ跨ぎはRTC値をそのまま使う)
     rtcMsPerCount[0] = prefs.getInt("msClose", MS_PER_COUNT_DEF);
     rtcMsPerCount[1] = prefs.getInt("msOpen",  MS_PER_COUNT_DEF);
+    rtcZoneMc        = prefs.getInt("zoneMc",  0);
   }
   prefs.end();
 
