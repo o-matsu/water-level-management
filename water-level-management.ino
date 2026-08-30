@@ -1,7 +1,12 @@
 // =====================================================================
-// 田圃水管理ロボット ファームウェア v0.4.0 (LittleFSログ版)
+// 田圃水管理ロボット ファームウェア v0.5.0 (ハイブリッド位置制御版)
 // 対象: ESP32 (Freenove WROOM 38pin) / Arduino IDE
 //
+// v0.5.0: 位置をホールエッジ+時間補間で 1/1000カウント(mc)単位で管理。
+//         - 開はFALLING、閉はRISINGを数える(どちらも磁石の同じ側=同じ物理点で止まる)
+//         - エッジ間は直近の実測速度(ms/カウント, 方向別に学習)で補間
+//         - CALIBのゼロ点・全開もmc精度で登録、閉はCLOSE_BIAS_MC手前で止めて弛みを作らない
+//         現場実測: 全開3カウントでは1カウント(31.5mm)の量子化が致命的だったため。
 // v0.4.0: LittleFSに /gate.csv としてイベントログを追記。
 //         jogにJAM監視、CLOSEのパルスなしTIMEOUTを位置喪失扱い、電極は1回通電で両読み、
 //         VERIFY中も手動SWを受付。
@@ -35,7 +40,6 @@
 #include <time.h>
 
 #define BENCH_MODE  0   // 卓上: 1(シリアルで水位指令) / 実運用: 0(電極センサ)
-#define CALIB_DEBUG 0   // 1: CALIBジョグ時にホールパルス間隔をシリアルに出す(v0.3.1-dbgの診断機能)
 #if BENCH_MODE
 RTC_DATA_ATTR char benchWater = 'h';  // 'h'=水位高(閉でよい) 'l'=水位低(開けたい)
 #endif
@@ -61,7 +65,7 @@ const int ACS_IDLE      = 1965;
 const int ACS_JAM_DELTA = 150;
 
 // ---------------- 機構・タイミング定数 ----------------
-const unsigned long MS_PER_TURN        = 1500;   // 10RPM 磁石4つ
+const int           MS_PER_COUNT_DEF   = 1300;   // 1カウント(磁石1個分)の初期想定時間。駆動ごとに実測で学習
 const unsigned long TURN_TIMEOUT_MARGIN = 4000;
 const uint64_t      SLEEP_US           = 10ULL * 60 * 1000000; // スリープ10分(水位サイクルと同一) ※64bit: 32bitだと2時間超で桁あふれ
 // const uint64_t      SLEEP_US           = 10ULL * 1000000; // スリープ10秒(短縮)
@@ -72,31 +76,44 @@ const int  WATER_ADC_THRESHOLD         = 2000;   // ★未確定: ログのCYCLE
 const unsigned long CALIB_CONFIRM_MS   = 10000;  // 10秒放置で確定
 const unsigned long CALIB_TIMEOUT_MS   = 30UL * 60 * 1000; // 30分で完全停止
 
+// ---------------- 位置(mc = 1/1000カウント, 1カウント≒31.5mm) ----------------
+const int32_t POS_UNKNOWN   = INT32_MIN;
+const int32_t CLOSE_BIAS_MC = 30;     // 閉はゼロ点のこれだけ手前で止める(≒1mm)。弛み→蓋の傾きを防ぐ
+const int32_t OPEN_MIN_MC   = 500;    // 全開登録の最小値(これ未満は無効)
+const int     MS_PER_COUNT_MIN = 300, MS_PER_COUNT_MAX = 5000;  // 学習に使うパルス間隔の妥当範囲
+
 // ---------------- ログ ----------------
 const char*  LOG_PATH      = "/gate.csv";
 const size_t LOG_MAX_BYTES = 1024UL * 1024;   // 約170日分(1シーズン)
 const size_t LOG_LINE_BYTES = 40;             // 1行の目安
 const size_t LOG_BYTES_PER_DAY = LOG_LINE_BYTES * (86400ULL * 1000000 / SLEEP_US); // ≒6KB(BOOT+CYCLE想定)
 
+// ---------------- 型(Arduinoの自動プロトタイプは最初の関数の直前に挿入されるため、全関数より前に置く) ----------------
+enum GateResult { GATE_OK, GATE_JAM, GATE_TIMEOUT };
+struct MoveResult  { GateResult r; int edges; };
+struct WaterSample { bool high; int adcHi; int adcLo; };   // adc=-1: BENCH(電極なし)
+
 // ---------------- 永続状態 ----------------
-#define RTC_MAGIC 0xA5A57002
+#define RTC_MAGIC 0xA5A57003
 RTC_DATA_ATTR uint32_t rtcMagic = 0;
-RTC_DATA_ATTR int      rtcPosition = -1;   // 現在位置[回転] 0=全閉 / -1=不定
+RTC_DATA_ATTR int32_t  rtcPosMc = POS_UNKNOWN;   // 現在位置[mc] 0=全閉(ゼロ点)
+RTC_DATA_ATTR int      rtcMsPerCount[2] = { MS_PER_COUNT_DEF, MS_PER_COUNT_DEF };  // [0]=閉 [1]=開 の学習速度
 
 Preferences prefs;
-int turnsOpen = 0;                          // 全開回転数(NVSからロード)
+int32_t openMc = 0;                         // 全開位置[mc](NVSからロード)
 
-// ---------------- 実行時状態 ----------------
-volatile int hallCount = 0;
-volatile unsigned long lastHallMs = 0;
-
-enum GateResult { GATE_OK, GATE_JAM, GATE_TIMEOUT };
 const char* gateResultName(GateResult r) {
   return r == GATE_OK ? "ok" : r == GATE_JAM ? "jam" : "timeout";
 }
+bool posKnown() { return rtcPosMc != POS_UNKNOWN; }
+bool isClosed() { return posKnown() && rtcPosMc < openMc / 2; }
 
-struct WaterSample { bool high; int adcHi; int adcLo; };   // adc=-1: BENCH(電極なし)
-WaterSample sampleWater();   // 手書き宣言(Arduinoの自動プロトタイプがstruct定義より前に置かれるのを回避)
+// ---------------- ホールエッジ(ISR→メインループへ受け渡し) ----------------
+volatile unsigned long lastHallMs = 0;
+volatile uint32_t edgeMs[8];
+volatile uint8_t  edgeLvl[8];
+volatile uint8_t  edgeHead = 0, edgeTail = 0;
+
 bool fsReady = false;
 
 // =====================================================================
@@ -200,19 +217,14 @@ const char* wakeCauseName() {
 // =====================================================================
 // 低レベル
 // =====================================================================
-#if CALIB_DEBUG
-volatile unsigned long pulseMs[32];
-volatile int pulseIdx = 0;
-#endif
-void IRAM_ATTR onHallPulse() {
+// CHANGEで両エッジを取り、レベルと時刻をリングに積む(判定はメインループ側)
+void IRAM_ATTR onHallEdge() {
   unsigned long now = millis();
-  if (now - lastHallMs > 50) {
-    hallCount++;
-#if CALIB_DEBUG
-    if (pulseIdx < 32) pulseMs[pulseIdx++] = now;
-#endif
-    lastHallMs = now;
-  }
+  if (now - lastHallMs < 20) return;   // デバウンス
+  lastHallMs = now;
+  edgeMs[edgeHead]  = now;
+  edgeLvl[edgeHead] = digitalRead(PIN_HALL);
+  edgeHead = (edgeHead + 1) & 7;
 }
 
 void relayAllOff() {
@@ -220,10 +232,10 @@ void relayAllOff() {
   digitalWrite(PIN_RELAY_CLOSE, RELAY_OFF);
 }
 
-int readACS() {
+int readACS() {   // 8サンプル≒16ms(駆動ループの停止分解能を保つため短め)
   long sum = 0;
-  for (int i = 0; i < 32; i++) { sum += analogRead(PIN_ACS); delay(2); }
-  return sum / 32;
+  for (int i = 0; i < 8; i++) { sum += analogRead(PIN_ACS); delay(2); }
+  return sum / 8;
 }
 
 bool isOverCurrent(int acs) { return abs(acs - ACS_IDLE) > ACS_JAM_DELTA; }
@@ -241,79 +253,118 @@ void ledBlink(int times, int onMs, int offMs) {
 }
 
 // =====================================================================
-// ゲート駆動(回転数指定・電流監視・タイムアウト)
-//  tag: ログのイベント名(OPEN/CLOSE/RETREAT)。1駆動=1行 "tag,結果,開始位置,実カウント,ACS"
+// ゲート駆動(ハイブリッド位置制御)
+//  位置[mc]をエッジで同期し、エッジ間は実測速度で時間補間する。
+//  開: FALLING(磁石がセンサに到達) / 閉: RISING(センサが同じ側から離脱) を数える
+//   → 方向によらず「磁石のA側」= 整数カウント位置で同期される。
+//  targetMc: 目標位置(POS_UNKNOWNなら目標なし=holdPinを離すまで)
+//  holdPin : 押している間だけ動かすSW(-1なら使わない)
+//  tag     : ログのイベント名。1駆動=1行 "tag,結果,開始mc,終了mc,エッジ数,ms/カウント,ACS"
 // =====================================================================
-GateResult driveTurns(bool dirOpen, int turns, const char* tag) {
-  if (turns <= 0) return GATE_OK;
+MoveResult moveGate(bool dirOpen, int32_t targetMc, int holdPin, const char* tag) {
+  int32_t startMc = posKnown() ? rtcPosMc : 0;
+  int dir = dirOpen ? 1 : -1;
+  bool hasTarget = (targetMc != POS_UNKNOWN);
+  if (hasTarget && (dirOpen ? startMc >= targetMc : startMc <= targetMc)) return { GATE_OK, 0 };
+
+  int &msPer = rtcMsPerCount[dirOpen ? 1 : 0];
   hallPower(true);
-  delay(100);          // センサ起動過渡(電源ON時の偽エッジ)が落ち着くまで待つ
-  hallCount = 0;       // ★クリアは電源ON後・アタッチ直前(v0.2.1修正)
-  attachInterrupt(digitalPinToInterrupt(PIN_HALL), onHallPulse, FALLING);
+  delay(100);                       // センサ起動過渡(電源ON時の偽エッジ)が落ち着くまで待つ
+  edgeHead = edgeTail = 0;
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL), onHallEdge, CHANGE);
 
-  unsigned long timeout = (unsigned long)turns * MS_PER_TURN + TURN_TIMEOUT_MARGIN;
+  unsigned long timeout = hasTarget
+      ? (unsigned long)(labs(targetMc - startMc) / 1000.0 * msPer) + TURN_TIMEOUT_MARGIN
+      : 0;
   unsigned long start = millis();
-  digitalWrite(dirOpen ? PIN_RELAY_OPEN : PIN_RELAY_CLOSE, RELAY_ON);
-  delay(300);  // 突入マスク
-
+  int32_t  anchorMc = startMc;      // 直近の同期位置
+  unsigned long anchorMs = start;   // その時刻
+  unsigned long prevCountedMs = 0;  // 直近の計数エッジ時刻(速度学習用)
+  int edges = 0;
+  int acs = -1;
   GateResult result = GATE_OK;
-  int acs = 0;
-  while (hallCount < turns) {
-    if (millis() - start > timeout) { result = GATE_TIMEOUT; break; }
+
+  digitalWrite(dirOpen ? PIN_RELAY_OPEN : PIN_RELAY_CLOSE, RELAY_ON);
+  delay(300);                       // 突入マスク(この間も位置は時間で進める)
+
+  auto estimate = [&](unsigned long atMs) -> int32_t {
+    if ((long)(atMs - anchorMs) < 0) atMs = anchorMs;   // 基準より古い時刻(起動直後の偽エッジ等)は進めない
+    return anchorMc + dir * (int32_t)((atMs - anchorMs) * 1000UL / (unsigned long)msPer);
+  };
+
+  while (true) {
+    // エッジ処理
+    while (edgeTail != edgeHead) {
+      unsigned long t = edgeMs[edgeTail];
+      bool counted = dirOpen ? (edgeLvl[edgeTail] == LOW) : (edgeLvl[edgeTail] == HIGH);
+      edgeTail = (edgeTail + 1) & 7;
+      if (!counted) continue;
+      int32_t est = estimate(t);
+      int32_t snapped = (int32_t)lroundf(est / 1000.0f) * 1000;   // 最寄りの整数カウントに同期
+      if (labs(est - snapped) > 400)
+        Serial.printf("[MOVE] edge far from estimate: est=%ld snap=%ld\n", (long)est, (long)snapped);
+      if (prevCountedMs) {
+        long iv = t - prevCountedMs;
+        if (iv >= MS_PER_COUNT_MIN && iv <= MS_PER_COUNT_MAX) msPer = (msPer + iv) / 2;  // 速度学習(EMA。パルスは規則的なので重め)
+      }
+      prevCountedMs = t;
+      anchorMc = snapped; anchorMs = t; edges++;
+    }
+    int32_t pos = estimate(millis());
+    if (hasTarget && (dirOpen ? pos >= targetMc : pos <= targetMc)) { anchorMc = targetMc; anchorMs = millis(); break; }
+    if (holdPin >= 0 && digitalRead(holdPin) != LOW) break;
+    if (timeout && millis() - start > timeout) { result = GATE_TIMEOUT; break; }
     acs = readACS();
-    if (isOverCurrent(acs))         { result = GATE_JAM;     break; }
-    delay(10);
+    if (isOverCurrent(acs)) { result = GATE_JAM; break; }
+    delay(5);
   }
   relayAllOff();
+  int32_t endMc = estimate(millis());
   detachInterrupt(digitalPinToInterrupt(PIN_HALL));
   hallPower(false);
-  if (acs == 0) acs = -1;   // ループに入る前に到達した(=未測定)場合は-1で区別
-  logEvent("%s,%s,%d,%d,%d", tag, gateResultName(result), rtcPosition, hallCount, acs);
+  rtcPosMc = endMc;
+  logEvent("%s,%s,%ld,%ld,%d,%d,%d", tag, gateResultName(result), (long)startMc, (long)endMc, edges, msPer, acs);
   delay(300);
-  return result;
+  return { result, edges };
 }
 
 // =====================================================================
 // 開閉シーケンス
-//  失敗時: 位置信頼を失う → rtcPosition=-1 → 次回起動でCALIB要求(LEDゆっくり点滅)
+//  失敗時: 位置信頼を失う → rtcPosMc=POS_UNKNOWN → 次回起動でCALIB要求(LEDゆっくり点滅)
 //  → 30分放置で消灯 → 「消灯=異常」の意味論に合流
 // =====================================================================
 bool openGate() {
-  if (rtcPosition < 0 || turnsOpen <= 0) return false;
-  if (rtcPosition >= turnsOpen) return true;
+  if (!posKnown() || openMc <= 0) return false;
+  if (rtcPosMc >= openMc) return true;
   digitalWrite(PIN_LED, HIGH);  // 動作中=点灯
-
-  GateResult r = driveTurns(true, turnsOpen - rtcPosition, "OPEN");
+  MoveResult m = moveGate(true, openMc, -1, "OPEN");
   digitalWrite(PIN_LED, LOW);
-  if (r == GATE_OK) { rtcPosition = turnsOpen; return true; }
+  if (m.r == GATE_OK) return true;
 
-  Serial.printf("[OPEN] fail(%d) -> position lost\n", r);
-  relayAllOff();
-  driveTurns(false, 1, "RETREAT");   // 安全側: 少し繰り出して張力を抜く(結果は見ない: どのみち位置は破棄しCALIBへ)
-  rtcPosition = -1;       // 次回起動でCALIB要求
+  Serial.printf("[OPEN] fail(%d) -> position lost\n", m.r);
+  moveGate(false, rtcPosMc - 1000, -1, "RETREAT");   // 安全側: 1カウント繰り出して張力を抜く(結果は見ない: どのみち位置は破棄しCALIBへ)
+  rtcPosMc = POS_UNKNOWN;
   return false;
 }
 
 bool closeGate() {
-  if (rtcPosition < 0) return false;
-  if (rtcPosition == 0) return true;
+  if (!posKnown()) return false;
+  if (rtcPosMc <= CLOSE_BIAS_MC) return true;
   digitalWrite(PIN_LED, HIGH);
-
-  // 繰り出しは常に「登録ゼロ点ぴったりまで」= 巻き戻りは構造的に起きない
-  GateResult r = driveTurns(false, rtcPosition, "CLOSE");
+  // 繰り出しは常に「登録ゼロ点のCLOSE_BIAS_MC手前まで」= 弛みも巻き戻りも作らない
+  MoveResult m = moveGate(false, CLOSE_BIAS_MC, -1, "CLOSE");
   digitalWrite(PIN_LED, LOW);
-  if (r == GATE_JAM) {    // 繰り出しJAM=ワイヤー絡み等の異常
+  if (m.r == GATE_JAM) {                       // 繰り出しJAM=ワイヤー絡み等の異常
     Serial.println("[CLOSE] jam -> position lost");
-    rtcPosition = -1;
+    rtcPosMc = POS_UNKNOWN;
     return false;
   }
-  if (r == GATE_TIMEOUT && hallCount == 0) {   // 1パルスも来ないTIMEOUT=ホールセンサ無応答(空転ではない)
-    Serial.println("[CLOSE] timeout with no hall pulses -> position lost");
-    rtcPosition = -1;
+  if (m.r == GATE_TIMEOUT && m.edges == 0) {   // 1エッジも来ないTIMEOUT=ホールセンサ無応答
+    Serial.println("[CLOSE] timeout with no hall edges -> position lost");
+    rtcPosMc = POS_UNKNOWN;
     return false;
   }
-  rtcPosition = 0;        // パルスありのTIMEOUTは着座後の空転猶予とみなしOK側に倒す
-  return true;
+  return true;   // エッジありのTIMEOUTは速度想定より遅かっただけとみなす(位置はmoveGateの推定値)
 }
 
 // =====================================================================
@@ -343,15 +394,15 @@ WaterSample sampleWater() {
   readElectrodes(w.adcHi, w.adcLo);
   if (wet(w.adcHi))       w.high = true;
   else if (!wet(w.adcLo)) w.high = false;
-  else                    w.high = (rtcPosition == 0);  // 中間帯は現状維持
+  else                    w.high = isClosed();  // 中間帯は現状維持
   return w;
 }
 #endif
 
 // 手動SWが押されていれば手動動作を実行して眠る(戻らない)。窓・VERIFY中の共通処理
 void manualSwitchCheck() {
-  if (digitalRead(PIN_SW_OPEN) == LOW)  { logEvent("MANUAL,open,%d",  rtcPosition); openGate();  goToSleep(); }
-  if (digitalRead(PIN_SW_CLOSE) == LOW) { logEvent("MANUAL,close,%d", rtcPosition); closeGate(); goToSleep(); }
+  if (digitalRead(PIN_SW_OPEN) == LOW)  { logEvent("MANUAL,open,%ld",  (long)rtcPosMc); openGate();  goToSleep(); }
+  if (digitalRead(PIN_SW_CLOSE) == LOW) { logEvent("MANUAL,close,%ld", (long)rtcPosMc); closeGate(); goToSleep(); }
 }
 
 // 待機しつつ手動SW/シリアルを見る(delayの置き換え)
@@ -391,46 +442,22 @@ bool verifyRequest(bool wantHigh) {
 //  → 自動で全閉まで繰り出して通常運用へ
 //  30分無操作 → LED消灯で永久停止(電源再投入のみで復帰)
 // =====================================================================
-void jog(bool dirOpen, int &netTurns) {
-  hallPower(true);
-  delay(100);          // v0.2.1: 起動過渡の偽エッジ対策
-  hallCount = 0;
-  attachInterrupt(digitalPinToInterrupt(PIN_HALL), onHallPulse, FALLING);
-  digitalWrite(dirOpen ? PIN_RELAY_OPEN : PIN_RELAY_CLOSE, RELAY_ON);
-  delay(300);  // 突入マスク
-  bool jam = false;
-  int acs = -1;
-  while (digitalRead(dirOpen ? PIN_SW_OPEN : PIN_SW_CLOSE) == LOW) {
-    acs = readACS();                       // 押している間もJAM監視(ワイヤー絡み等で自動停止)
-    if (isOverCurrent(acs)) { jam = true; break; }
-    delay(10);
-  }
-  relayAllOff();
-  detachInterrupt(digitalPinToInterrupt(PIN_HALL));
-  hallPower(false);
-  netTurns += dirOpen ? hallCount : -hallCount;
-  Serial.printf("[JOG] dir=%s hallCount=%d -> netTurns=%d (GPIO35 now=%d)%s\n",
-                dirOpen ? "OPEN" : "CLOSE", hallCount, netTurns, digitalRead(PIN_HALL),
-                jam ? " JAM -> stopped" : "");
-  logEvent("CALIB,jog,%s,%s,%d,%d,%d", dirOpen ? "open" : "close", jam ? "jam" : "ok", hallCount, netTurns, acs);
-  if (jam) {
+void jog(bool dirOpen) {
+  int pin = dirOpen ? PIN_SW_OPEN : PIN_SW_CLOSE;
+  MoveResult m = moveGate(dirOpen, POS_UNKNOWN, pin, "JOG");   // 押している間だけ。JAMで自動停止
+  Serial.printf("[JOG] dir=%s -> pos=%ld mc%s\n", dirOpen ? "OPEN" : "CLOSE", (long)rtcPosMc,
+                m.r == GATE_JAM ? " JAM -> stopped" : "");
+  if (m.r == GATE_JAM) {
     ledBlink(10, 50, 50);   // 速点滅×10=異常(全開無効と同じ合図)。SWを離すまで待って再開
-    while (digitalRead(dirOpen ? PIN_SW_OPEN : PIN_SW_CLOSE) == LOW) delay(20);
+    while (digitalRead(pin) == LOW) delay(20);
   }
-#if CALIB_DEBUG
-  for (int i = 1; i < pulseIdx; i++) {
-    Serial.printf("  pulse[%d] interval = %lu ms\n", i, pulseMs[i] - pulseMs[i-1]);
-  }
-  pulseIdx = 0;
-#endif
-  delay(300);
 }
 
 void calibMode() {
   Serial.println("[CALIB] enter. jog with SW, leave 10s to confirm. (serial d/i/x also accepted)");
-  logEvent("CALIB,enter,%d,%d", rtcPosition, turnsOpen);
+  logEvent("CALIB,enter,%ld,%ld", posKnown() ? (long)rtcPosMc : -1L, (long)openMc);
+  rtcPosMc = 0;           // ゼロ点確定までは仮の座標系(rtcMagicは未設定のまま=再起動すればCALIBに戻る)
   int phase = 0;          // 0=ゼロ点待ち 1=全開位置待ち
-  int netTurns = 0;       // ゼロ点確定後の累積回転
   bool touched = false;   // このフェーズで一度でも操作されたか
   unsigned long lastAction = millis();
   unsigned long enterTime  = millis();
@@ -454,40 +481,41 @@ void calibMode() {
     // シリアルコマンド(d/i/x): 持ち帰り時はRTCメモリ消失でここに来るのでCALIB中も受け付ける
     if (handleSerialCommand()) { enterTime = millis(); lastAction = millis(); }  // ダンプ中に10秒確定が走らないよう両方延長
     // ジョグ
-    if (digitalRead(PIN_SW_OPEN) == LOW)  { digitalWrite(PIN_LED, HIGH); jog(true,  netTurns); touched = true; lastAction = millis(); enterTime = millis(); }
-    if (digitalRead(PIN_SW_CLOSE) == LOW) { digitalWrite(PIN_LED, HIGH); jog(false, netTurns); touched = true; lastAction = millis(); enterTime = millis(); }
+    if (digitalRead(PIN_SW_OPEN) == LOW)  { digitalWrite(PIN_LED, HIGH); jog(true);  touched = true; lastAction = millis(); enterTime = millis(); }
+    if (digitalRead(PIN_SW_CLOSE) == LOW) { digitalWrite(PIN_LED, HIGH); jog(false); touched = true; lastAction = millis(); enterTime = millis(); }
 
     // 10秒放置で確定(そのフェーズで一度は操作があった場合のみ)
     if (touched && millis() - lastAction > CALIB_CONFIRM_MS) {
       if (phase == 0) {
-        netTurns = 0;                       // ここがゼロ点
+        rtcPosMc = 0;                       // ここがゼロ点
         ledBlink(3, 100, 100);
         Serial.println("[CALIB] zero registered");
         logEvent("CALIB,zero");
         phase = 1; touched = false; lastAction = millis(); enterTime = millis();
       } else {
-        Serial.printf("[CALIB] confirm check: netTurns=%d\n", netTurns);
-        if (netTurns <= 0) {                // 全開が0以下は無効。やり直し待ち
+        Serial.printf("[CALIB] confirm check: pos=%ld mc\n", (long)rtcPosMc);
+        if (rtcPosMc < OPEN_MIN_MC) {       // 全開が小さすぎる/ゼロ点より閉側は無効。やり直し待ち
           ledBlink(10, 50, 50);
-          Serial.println("[CALIB] invalid open position (<=0). jog again.");
-          logEvent("CALIB,invalid,%d", netTurns);
+          Serial.println("[CALIB] invalid open position. jog again.");
+          logEvent("CALIB,invalid,%ld", (long)rtcPosMc);
           touched = false; lastAction = millis();
           continue;
         }
-        turnsOpen = netTurns;
+        openMc = rtcPosMc;
         prefs.begin("gate", false);
-        prefs.putInt("turnsOpen", turnsOpen);
+        prefs.putInt("openMc", openMc);
+        prefs.putInt("msClose", rtcMsPerCount[0]);
+        prefs.putInt("msOpen",  rtcMsPerCount[1]);
         prefs.end();
         ledBlink(5, 100, 100);
-        Serial.printf("[CALIB] open position registered: %d turns\n", turnsOpen);
-        logEvent("CALIB,open,%d", turnsOpen);
+        Serial.printf("[CALIB] open position registered: %ld mc (%.2f counts)\n", (long)openMc, openMc / 1000.0);
+        logEvent("CALIB,open,%ld,%d,%d", (long)openMc, rtcMsPerCount[0], rtcMsPerCount[1]);
 
         // 登録した全開位置から全閉へ戻して運用開始
-        rtcPosition = netTurns;
         rtcMagic = RTC_MAGIC;
         closeGate();
         Serial.println("[CALIB] done -> normal operation");
-        logEvent("CALIB,done,%d", rtcPosition);
+        logEvent("CALIB,done,%ld", (long)rtcPosMc);
         return;
       }
     }
@@ -512,12 +540,12 @@ void wakeCycle() {
 
   WaterSample w = sampleWater();
   bool shouldClose = w.high;
-  bool isClosed = (rtcPosition == 0);
-  const char* action = (shouldClose == isClosed) ? "keep" : shouldClose ? "close" : "open";
-  Serial.printf("[CYCLE] wantHigh=%d position=%d(%s) -> %s\n",
-                w.high, rtcPosition, isClosed ? "closed" : "open", action);
-  logEvent("CYCLE,%d,%d,%d,%s", w.adcHi, w.adcLo, rtcPosition, action);
-  if (shouldClose != isClosed) {
+  bool closed = isClosed();
+  const char* action = (shouldClose == closed) ? "keep" : shouldClose ? "close" : "open";
+  Serial.printf("[CYCLE] wantHigh=%d position=%ld mc(%s) -> %s\n",
+                w.high, (long)rtcPosMc, closed ? "closed" : "open", action);
+  logEvent("CYCLE,%d,%d,%ld,%s", w.adcHi, w.adcLo, (long)rtcPosMc, action);
+  if (shouldClose != closed) {
     if (verifyRequest(w.high)) {
       if (shouldClose) closeGate();
       else             openGate();
@@ -532,7 +560,7 @@ void goToSleep() {
   digitalWrite(PIN_LED, LOW);
   // 位置を失っていたら眠らずCALIBへ(再起動で入口から)
   LittleFS.end();
-  if (rtcPosition < 0) { rtcMagic = 0; ESP.restart(); }
+  if (!posKnown()) { rtcMagic = 0; ESP.restart(); }
   // スリープ中のリレーIN浮き対策: OFFレベルでピン状態を固定
   gpio_hold_en((gpio_num_t)PIN_RELAY_OPEN);
   gpio_hold_en((gpio_num_t)PIN_RELAY_CLOSE);
@@ -566,15 +594,19 @@ void setup() {
   analogSetPinAttenuation(PIN_ELEC_LOW,  ADC_11db);
 
   prefs.begin("gate", true);
-  turnsOpen = prefs.getInt("turnsOpen", 0);
+  openMc = prefs.getInt("openMc", 0);
+  if (rtcMagic != RTC_MAGIC) {   // cold/reset時は学習速度をNVSから復元(スリープ跨ぎはRTC値をそのまま使う)
+    rtcMsPerCount[0] = prefs.getInt("msClose", MS_PER_COUNT_DEF);
+    rtcMsPerCount[1] = prefs.getInt("msOpen",  MS_PER_COUNT_DEF);
+  }
   prefs.end();
 
   logInit();
-  logEvent("BOOT,%s,%d,%d", wakeCauseName(), rtcPosition, turnsOpen);
+  logEvent("BOOT,%s,%ld,%ld", wakeCauseName(), posKnown() ? (long)rtcPosMc : -1L, (long)openMc);
 
   // 入口の2段の門:
   //  位置不定 or 全開回転数未登録 → CALIB / それ以外 → 通常サイクル
-  if (rtcMagic != RTC_MAGIC || rtcPosition < 0 || turnsOpen <= 0) {
+  if (rtcMagic != RTC_MAGIC || !posKnown() || openMc <= 0) {
     calibMode();          // 完了時のみ戻ってくる(rtcMagic等は設定済み)
   }
   wakeCycle();            // 1起床分を実行して眠る(戻らない)
