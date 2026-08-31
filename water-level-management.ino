@@ -1,7 +1,10 @@
 // =====================================================================
-// 田圃水管理ロボット ファームウェア v0.5.1 (ハイブリッド位置制御版)
+// 田圃水管理ロボット ファームウェア v0.5.2 (ハイブリッド位置制御版)
 // 対象: ESP32 (Freenove WROOM 38pin) / Arduino IDE
 //
+// v0.5.2: 一晩の現場ログより: 電極閾値270に(水膜1900をWET誤判定しゲートが開かなかった)。
+//         上のみ濡れの矛盾状態は現状維持。磁石位相を学習し任意ゼロ点でもエッジ同期が効くように
+//         (従来は磁石が整数位置にある前提で、位相が350mcを超えるCALIBでは全エッジ棄却→時間補間のみだった)。
 // v0.5.1: リレー投入ノイズの偽エッジ対策(マスク・棄却・学習の妥当範囲)、磁石検出幅の学習とB側エッジ再同期。
 // v0.5.0: 位置をホールエッジ+時間補間で 1/1000カウント(mc)単位で管理。
 //         - 開はFALLING、閉はRISINGを数える(どちらも磁石の同じ側=同じ物理点で止まる)
@@ -73,7 +76,7 @@ const uint64_t      SLEEP_US           = 10ULL * 60 * 1000000; // スリープ10
 const unsigned long SW_WINDOW_MS       = 5000;   // 起床後の手動SW受付ウィンドウ
 const int  VERIFY_COUNT                = 6;
 const unsigned long VERIFY_INTERVAL_MS = 10000;
-const int  WATER_ADC_THRESHOLD         = 2000;   // ★未確定: ログのCYCLE行(上ADC,下ADC)を1〜2日分見てWET/DRYの谷間に置く
+const int  WATER_ADC_THRESHOLD         = 270;    // 現場実測(2026-08-31): 水没116〜231 / 水膜(水面より上)310〜1900 / 乾燥4095。水膜をDRYに倒す
 const unsigned long CALIB_CONFIRM_MS   = 10000;  // 10秒放置で確定
 const unsigned long CALIB_TIMEOUT_MS   = 30UL * 60 * 1000; // 30分で完全停止
 
@@ -103,6 +106,9 @@ RTC_DATA_ATTR uint32_t rtcMagic = 0;
 RTC_DATA_ATTR int32_t  rtcPosMc = POS_UNKNOWN;   // 現在位置[mc] 0=全閉(ゼロ点)
 RTC_DATA_ATTR int      rtcMsPerCount[2] = { MS_PER_COUNT_DEF, MS_PER_COUNT_DEF };  // [0]=閉 [1]=開 の学習速度
 RTC_DATA_ATTR int32_t  rtcZoneMc = 0;            // 磁石の検出幅[mc](0=未学習)。B側エッジでの再同期に使う
+RTC_DATA_ATTR int32_t  rtcPhaseMc = -1;          // 磁石A側位置の座標内オフセット[mc, mod 1000](-1=未学習)。
+                                                 //  ゼロ点は任意の位置なので磁石は整数位置にいるとは限らない
+int32_t mod1000(int32_t v) { return ((v % 1000) + 1000) % 1000; }
 
 Preferences prefs;
 int32_t openMc = 0;                         // 全開位置[mc](NVSからロード)
@@ -313,17 +319,22 @@ MoveResult moveGate(bool dirOpen, int32_t targetMc, int holdPin, const char* tag
       int32_t est = estimate(t);
       int32_t snapped;
       if (aSide) {
-        snapped = (int32_t)lroundf(est / 1000.0f) * 1000;                       // 整数カウント
+        if (rtcPhaseMc < 0) {           // 位相未学習: 最初のA側エッジの推定位置をそのまま磁石位置として学習
+          rtcPhaseMc = mod1000(est);
+          snapped = est;
+        } else {
+          snapped = (int32_t)lroundf((est - rtcPhaseMc) / 1000.0f) * 1000 + rtcPhaseMc;   // 位相+整数カウント
+        }
       } else {
-        if (rtcZoneMc <= 0) {
-          // 検出幅未学習: 開方向ならA側からの経過で幅を学習(B側は整数+幅)
+        if (rtcZoneMc <= 0 || rtcPhaseMc < 0) {
+          // 検出幅未学習: 開方向ならA側からの経過で幅を学習(B側は位相+整数+幅)
           if (dirOpen && lastASideMs) {
             int32_t w = (int32_t)((t - lastASideMs) * 1000UL / (unsigned long)msPer);
             if (w >= ZONE_MIN_MC && w <= ZONE_MAX_MC) rtcZoneMc = w;
           }
           continue;
         }
-        snapped = (int32_t)lroundf((est - rtcZoneMc) / 1000.0f) * 1000 + rtcZoneMc;   // 整数+検出幅
+        snapped = (int32_t)lroundf((est - rtcPhaseMc - rtcZoneMc) / 1000.0f) * 1000 + rtcPhaseMc + rtcZoneMc;
       }
       if (labs(est - snapped) > EDGE_SNAP_TOL_MC) {         // 推定と合わない=偽エッジ
         Serial.printf("[MOVE] reject edge: est=%ld snap=%ld\n", (long)est, (long)snapped);
@@ -375,7 +386,7 @@ bool openGate() {
 
   Serial.printf("[OPEN] fail(%d) -> position lost\n", m.r);
   moveGate(false, rtcPosMc - 1000, -1, "RETREAT");   // 安全側: 1カウント繰り出して張力を抜く(結果は見ない: どのみち位置は破棄しCALIBへ)
-  rtcPosMc = POS_UNKNOWN;
+  rtcPosMc = POS_UNKNOWN; rtcPhaseMc = -1;
   return false;
 }
 
@@ -388,12 +399,12 @@ bool closeGate() {
   digitalWrite(PIN_LED, LOW);
   if (m.r == GATE_JAM) {                       // 繰り出しJAM=ワイヤー絡み等の異常
     Serial.println("[CLOSE] jam -> position lost");
-    rtcPosMc = POS_UNKNOWN;
+    rtcPosMc = POS_UNKNOWN; rtcPhaseMc = -1;
     return false;
   }
   if (m.r == GATE_TIMEOUT && m.edges == 0) {   // 1エッジも来ないTIMEOUT=ホールセンサ無応答
     Serial.println("[CLOSE] timeout with no hall edges -> position lost");
-    rtcPosMc = POS_UNKNOWN;
+    rtcPosMc = POS_UNKNOWN; rtcPhaseMc = -1;
     return false;
   }
   return true;   // エッジありのTIMEOUTは速度想定より遅かっただけとみなす(位置はmoveGateの推定値)
@@ -424,9 +435,10 @@ void readElectrodes(int &adcHi, int &adcLo) {
 WaterSample sampleWater() {
   WaterSample w = { false, -1, -1 };
   readElectrodes(w.adcHi, w.adcLo);
-  if (wet(w.adcHi))       w.high = true;
-  else if (!wet(w.adcLo)) w.high = false;
-  else                    w.high = isClosed();  // 中間帯は現状維持
+  bool hiWet = wet(w.adcHi), loWet = wet(w.adcLo);
+  if (hiWet && loWet)        w.high = true;
+  else if (!hiWet && !loWet) w.high = false;
+  else                       w.high = isClosed();  // 中間帯(下のみ濡れ) / 矛盾(上のみ濡れ=水膜・断線等)は現状維持
   return w;
 }
 #endif
@@ -488,6 +500,8 @@ void jog(bool dirOpen) {
 void calibMode() {
   Serial.println("[CALIB] enter. jog with SW, leave 10s to confirm. (serial d/i/x also accepted)");
   logEvent("CALIB,enter,%ld,%ld", posKnown() ? (long)rtcPosMc : -1L, (long)openMc);
+  if (posKnown() && rtcPhaseMc >= 0) rtcPhaseMc = mod1000(rtcPhaseMc - rtcPosMc);  // 座標を張り替えても磁石位相は維持
+  else rtcPhaseMc = -1;
   rtcPosMc = 0;           // ゼロ点確定までは仮の座標系(rtcMagicは未設定のまま=再起動すればCALIBに戻る)
   int phase = 0;          // 0=ゼロ点待ち 1=全開位置待ち
   bool touched = false;   // このフェーズで一度でも操作されたか
@@ -519,6 +533,7 @@ void calibMode() {
     // 10秒放置で確定(そのフェーズで一度は操作があった場合のみ)
     if (touched && millis() - lastAction > CALIB_CONFIRM_MS) {
       if (phase == 0) {
+        if (rtcPhaseMc >= 0) rtcPhaseMc = mod1000(rtcPhaseMc - rtcPosMc);  // ゼロ点移動に合わせ位相も張り替え
         rtcPosMc = 0;                       // ここがゼロ点
         ledBlink(3, 100, 100);
         Serial.println("[CALIB] zero registered");
