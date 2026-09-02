@@ -1,7 +1,10 @@
 // =====================================================================
-// 田圃水管理ロボット ファームウェア v0.5.2 (ハイブリッド位置制御版)
+// 田圃水管理ロボット ファームウェア v0.5.3 (ハイブリッド位置制御版)
 // 対象: ESP32 (Freenove WROOM 38pin) / Arduino IDE
 //
+// v0.5.3: 電極を上下(hi/lo)ではなく対称なA(VP)/B(VN)として扱う。判定は濡れ本数(2=閉/0=開/1=維持)。
+//         2026-09-02までの現場ログで電極が物理的に上下逆でも制御・ログとも問題ないことを確認したため、
+//         コード・ログ・ドキュメントから上下の区別を撤廃(ログのCYCLE/VERIFY列の構造は不変、意味がA/Bに)。
 // v0.5.2: 一晩の現場ログより: 電極閾値270に(水膜1900をWET誤判定しゲートが開かなかった)。
 //         上のみ濡れの矛盾状態は現状維持。磁石位相を学習し任意ゼロ点でもエッジ同期が効くように
 //         (従来は磁石が整数位置にある前提で、位相が350mcを超えるCALIBでは全エッジ棄却→時間補間のみだった)。
@@ -57,8 +60,8 @@ const int PIN_ACS         = 34;
 const int PIN_SW_OPEN     = 33;
 const int PIN_SW_CLOSE    = 13;
 const int PIN_ELEC_DRIVE  = 4;
-const int PIN_ELEC_HIGH   = 36;
-const int PIN_ELEC_LOW    = 39;
+const int PIN_ELEC_A      = 36;   // VP。判定は対称なので電極の取り付け上下は問わない
+const int PIN_ELEC_B      = 39;   // VN
 const int PIN_LED         = 2;    // 内蔵LED(出力専用として使用)
 
 const int RELAY_ON  = HIGH;       // ★実機確認済: HIGHでON
@@ -98,7 +101,7 @@ const size_t LOG_BYTES_PER_DAY = LOG_LINE_BYTES * (86400ULL * 1000000 / SLEEP_US
 // ---------------- 型(Arduinoの自動プロトタイプは最初の関数の直前に挿入されるため、全関数より前に置く) ----------------
 enum GateResult { GATE_OK, GATE_JAM, GATE_TIMEOUT };
 struct MoveResult  { GateResult r; int edges; };
-struct WaterSample { bool high; int adcHi; int adcLo; };   // adc=-1: BENCH(電極なし)
+struct WaterSample { bool high; int adcA; int adcB; };   // adc=-1: BENCH(電極なし)
 
 // ---------------- 永続状態 ----------------
 #define RTC_MAGIC 0xA5A57003
@@ -422,23 +425,23 @@ int avgAdc(int pin) {
   for (int i = 0; i < 8; i++) { sum += analogRead(pin); delay(2); }
   return sum / 8;
 }
-// 1回の通電で上下両方を読む(電食を抑えるため通電時間を最小に)
-void readElectrodes(int &adcHi, int &adcLo) {
+// 1回の通電で両電極を読む(電食を抑えるため通電時間を最小に)
+void readElectrodes(int &adcA, int &adcB) {
   digitalWrite(PIN_ELEC_DRIVE, HIGH);
   delay(30);
-  adcHi = avgAdc(PIN_ELEC_HIGH);
-  adcLo = avgAdc(PIN_ELEC_LOW);
+  adcA = avgAdc(PIN_ELEC_A);
+  adcB = avgAdc(PIN_ELEC_B);
   digitalWrite(PIN_ELEC_DRIVE, LOW);
-  Serial.printf("[ELEC] VP(上)=%d %s / VN(下)=%d %s\n",
-                adcHi, wet(adcHi) ? "WET" : "DRY", adcLo, wet(adcLo) ? "WET" : "DRY");
+  Serial.printf("[ELEC] A(VP)=%d %s / B(VN)=%d %s\n",
+                adcA, wet(adcA) ? "WET" : "DRY", adcB, wet(adcB) ? "WET" : "DRY");
 }
 WaterSample sampleWater() {
   WaterSample w = { false, -1, -1 };
-  readElectrodes(w.adcHi, w.adcLo);
-  bool hiWet = wet(w.adcHi), loWet = wet(w.adcLo);
-  if (hiWet && loWet)        w.high = true;
-  else if (!hiWet && !loWet) w.high = false;
-  else                       w.high = isClosed();  // 中間帯(下のみ濡れ) / 矛盾(上のみ濡れ=水膜・断線等)は現状維持
+  readElectrodes(w.adcA, w.adcB);
+  int nWet = (wet(w.adcA) ? 1 : 0) + (wet(w.adcB) ? 1 : 0);
+  if (nWet == 2)      w.high = true;
+  else if (nWet == 0) w.high = false;
+  else                w.high = isClosed();  // 片方のみ濡れ(中間水位・水膜・断線等)は現状維持。上下対称なので取り付けの上下は問わない
   return w;
 }
 #endif
@@ -468,7 +471,7 @@ bool verifyRequest(bool wantHigh) {
     Serial.printf("[VERIFY] %d/%d: wantHigh=%d now=%d\n", i + 1, VERIFY_COUNT, wantHigh, w.high);
     if (w.high != wantHigh) {
       Serial.println("[VERIFY] flipped -> cancel");
-      logEvent("VERIFY,cancel,%d,%d,%d", i + 1, w.adcHi, w.adcLo);
+      logEvent("VERIFY,cancel,%d,%d,%d", i + 1, w.adcA, w.adcB);
       digitalWrite(PIN_LED, LOW);
       return false;
     }
@@ -592,7 +595,7 @@ void wakeCycle() {
   const char* action = (shouldClose == closed) ? "keep" : shouldClose ? "close" : "open";
   Serial.printf("[CYCLE] wantHigh=%d position=%ld mc(%s) -> %s\n",
                 w.high, (long)rtcPosMc, closed ? "closed" : "open", action);
-  logEvent("CYCLE,%d,%d,%ld,%s", w.adcHi, w.adcLo, (long)rtcPosMc, action);
+  logEvent("CYCLE,%d,%d,%ld,%s", w.adcA, w.adcB, (long)rtcPosMc, action);
   if (shouldClose != closed) {
     if (verifyRequest(w.high)) {
       if (shouldClose) closeGate();
@@ -638,8 +641,8 @@ void setup() {
 
   Serial.begin(115200);
   analogSetPinAttenuation(PIN_ACS, ADC_11db);
-  analogSetPinAttenuation(PIN_ELEC_HIGH, ADC_11db);
-  analogSetPinAttenuation(PIN_ELEC_LOW,  ADC_11db);
+  analogSetPinAttenuation(PIN_ELEC_A, ADC_11db);
+  analogSetPinAttenuation(PIN_ELEC_B, ADC_11db);
 
   prefs.begin("gate", true);
   openMc = prefs.getInt("openMc", 0);
